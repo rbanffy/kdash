@@ -13,7 +13,7 @@ use ratatui::{
 
 use super::{
   key_binding::DEFAULT_KEYBINDING,
-  models::{AppResource, KubeResource, Named},
+  models::{AppResource, KubeResource, LogStyles, Named},
   utils::{self, UNKNOWN},
   ActiveBlock, App,
 };
@@ -25,8 +25,8 @@ use crate::{
     describe_yaml_and_logs_hint, draw_describe_block, draw_resource_block, draw_yaml_block,
     get_describe_active, get_resource_title, help_bold_line, help_part, layout_block_top_border,
     loading, mixed_bold_line, responsive_columns, style_caution, style_failure, style_help,
-    style_success, style_text, title_with_dual_style, wide_hint, ColumnDef, ResourceTableProps,
-    ViewTier,
+    style_label, style_success, style_text, style_warning, title_with_dual_style, wide_hint,
+    ColumnDef, ResourceTableProps, ViewTier,
   },
 };
 
@@ -502,7 +502,12 @@ pub(crate) fn draw_logs_block(f: &mut Frame<'_>, app: &mut App, area: Rect) {
       f,
       area,
       block,
-      style_text(app.palette),
+      LogStyles::with_json_styles(
+        style_text(app.palette),
+        style_label(app.palette),
+        style_failure(app.palette),
+        style_warning(app.palette),
+      ),
       app.log_auto_scroll,
       app.log_wrap,
     );

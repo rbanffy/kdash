@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- JSON log keys and error/warning levels use theme colors, including timestamped and aggregate logs.
+
 ## [2.1.1] - 2026-07-22
 
 ### Fixed

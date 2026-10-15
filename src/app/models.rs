@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, ops::Range};
 
 use async_trait::async_trait;
 use ratatui::{
@@ -10,7 +10,10 @@ use ratatui::{
 };
 use serde::Serialize;
 
-use super::{ActiveBlock, App, Route};
+use super::{
+  log_highlight::{json_log_highlights, JsonHighlight},
+  ActiveBlock, App, Route,
+};
 use crate::{handlers::ScrollEvent, network::Network};
 
 #[async_trait]
@@ -358,13 +361,54 @@ impl Scrollable for ScrollableTxt {
 // TODO implement line buffer to avoid gathering too much data in memory
 const MAX_LOG_RECORDS: usize = 10_000;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LogStyles {
+  text: Style,
+  json_key: Style,
+  error_level: Style,
+  warning_level: Style,
+}
+
+impl LogStyles {
+  pub(crate) fn with_json_styles(
+    text: Style,
+    json_key: Style,
+    error_level: Style,
+    warning_level: Style,
+  ) -> Self {
+    Self {
+      text,
+      json_key,
+      error_level,
+      warning_level,
+    }
+  }
+}
+
+impl From<Style> for LogStyles {
+  fn from(text: Style) -> Self {
+    Self::with_json_styles(text, text, text, text)
+  }
+}
+
+#[derive(Debug, Clone)]
+struct WrappedLogs {
+  items: Vec<ListItem<'static>>,
+  width: u16,
+  styles: LogStyles,
+}
+
+#[derive(Debug, Clone)]
+struct LogRecord {
+  text: String,
+  wrapped: Option<WrappedLogs>,
+  highlights: Option<Vec<(Range<usize>, JsonHighlight)>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LogsState {
-  /// Stores the log messages to be displayed
-  ///
-  /// (original_message, (wrapped_message, wrapped_at_width))
-  #[allow(clippy::type_complexity)]
-  records: VecDeque<(String, Option<(Vec<ListItem<'static>>, u16)>)>,
+  /// Original log text and render caches, bounded to `MAX_LOG_RECORDS`.
+  records: VecDeque<LogRecord>,
   wrapped_length: usize,
   viewport_height: usize,
   pub state: ListState,
@@ -386,28 +430,29 @@ impl LogsState {
   pub fn get_plain_text(&self) -> String {
     self.records.iter().fold(String::new(), |mut acc, v| {
       acc.push('\n');
-      acc.push_str(v.0.as_str());
+      acc.push_str(v.text.as_str());
       acc
     })
   }
 
   /// Render the current state as a list widget
-  pub fn render_list(
+  pub fn render_list<S: Into<LogStyles>>(
     &mut self,
     f: &mut Frame<'_>,
     logs_area: Rect,
     block: Block<'_>,
-    style: Style,
+    styles: S,
     follow: bool,
     wrap: bool,
   ) {
+    let styles = styles.into();
     let available_lines = logs_area.height as usize;
     self.viewport_height = available_lines;
     let wrap_width = logs_area.width.max(1);
     let mut items = if wrap {
-      self.wrapped_items(wrap_width, style)
+      self.wrapped_items(wrap_width, styles)
     } else {
-      self.unwrapped_items(style)
+      self.unwrapped_items(styles)
     };
     self.wrapped_length = items.len();
 
@@ -430,7 +475,11 @@ impl LogsState {
   /// Add a record to be displayed
   #[cfg(test)]
   pub fn add_record(&mut self, record: String) {
-    self.records.push_back((record, None));
+    self.records.push_back(LogRecord {
+      text: record,
+      wrapped: None,
+      highlights: None,
+    });
     while self.records.len() > MAX_LOG_RECORDS {
       self.records.pop_front();
     }
@@ -439,7 +488,11 @@ impl LogsState {
   /// Add multiple records in a batch
   pub fn add_records(&mut self, records: Vec<String>) {
     for record in records {
-      self.records.push_back((record, None));
+      self.records.push_back(LogRecord {
+        text: record,
+        wrapped: None,
+        highlights: None,
+      });
     }
     while self.records.len() > MAX_LOG_RECORDS {
       self.records.pop_front();
@@ -453,7 +506,7 @@ impl LogsState {
       .iter()
       .rev()
       .take(n)
-      .map(|(s, _)| s.as_str())
+      .map(|record| record.text.as_str())
       .collect()
   }
 
@@ -470,45 +523,107 @@ impl LogsState {
 
   /// One ListItem per record, unwrapped. The List widget truncates lines wider
   /// than the viewport, so long lines stay on a single row instead of reflowing.
-  fn unwrapped_items(&self, style: Style) -> Vec<ListItem<'static>> {
+  fn unwrapped_items(&mut self, styles: LogStyles) -> Vec<ListItem<'static>> {
     self
       .records
-      .iter()
-      .map(|record| ListItem::new(Span::styled(record.0.clone(), style)))
+      .iter_mut()
+      .map(|record| {
+        if record.highlights.is_none() {
+          record.highlights = Some(json_log_highlights(&record.text));
+        }
+        ListItem::new(RatatuiLine::from(styled_log_spans(
+          &record.text,
+          0..record.text.len(),
+          record.highlights.as_deref().unwrap_or_default(),
+          styles,
+        )))
+      })
       .collect()
   }
 
-  fn wrapped_items(&mut self, width: u16, style: Style) -> Vec<ListItem<'static>> {
+  fn wrapped_items(&mut self, width: u16, styles: LogStyles) -> Vec<ListItem<'static>> {
     let logs_area_width = width as usize;
 
     self
       .records
       .iter_mut()
       .flat_map(|record| {
-        if let Some(wrapped) = &record.1 {
-          if wrapped.1 == width {
-            return wrapped.0.clone();
+        if record.highlights.is_none() {
+          record.highlights = Some(json_log_highlights(&record.text));
+        }
+        let highlights = record.highlights.as_deref().unwrap_or_default();
+        if let Some(wrapped) = &record.wrapped {
+          if wrapped.width == width && wrapped.styles == styles {
+            return wrapped.items.clone();
           }
         }
 
-        record.1 = Some((
-          textwrap::wrap(record.0.as_ref(), logs_area_width)
-            .into_iter()
-            .map(|line| line.to_string())
-            .map(|line| Span::styled(line, style))
-            .map(ListItem::new)
-            .collect::<Vec<ListItem<'_>>>(),
-          width,
-        ));
+        let mut search_from = 0;
+        let items: Vec<ListItem<'static>> = textwrap::wrap(record.text.as_ref(), logs_area_width)
+          .into_iter()
+          .map(|line| {
+            let line = line.as_ref();
+            let relative_start = record.text[search_from..]
+              .find(line)
+              .expect("textwrap output must be found in the original log record");
+            let start = search_from + relative_start;
+            let end = start + line.len();
+            search_from = end;
+            ListItem::new(RatatuiLine::from(styled_log_spans(
+              &record.text,
+              start..end,
+              highlights,
+              styles,
+            )))
+          })
+          .collect();
 
-        record
-          .1
-          .as_ref()
-          .map(|wrapped| wrapped.0.clone())
-          .unwrap_or_default()
+        record.wrapped = Some(WrappedLogs {
+          items: items.clone(),
+          width,
+          styles,
+        });
+        items
       })
       .collect()
   }
+}
+
+fn styled_log_spans(
+  line: &str,
+  range: Range<usize>,
+  highlights: &[(Range<usize>, JsonHighlight)],
+  styles: LogStyles,
+) -> Vec<Span<'static>> {
+  let mut spans = Vec::new();
+  let mut cursor = range.start;
+
+  for (highlight_range, highlight) in highlights {
+    let start = highlight_range.start.max(range.start);
+    let end = highlight_range.end.min(range.end);
+    if start >= end || end <= cursor {
+      continue;
+    }
+    if cursor < start {
+      spans.push(Span::styled(line[cursor..start].to_string(), styles.text));
+    }
+    let highlight_style = match highlight {
+      JsonHighlight::Key => styles.json_key,
+      JsonHighlight::ErrorLevel => styles.error_level,
+      JsonHighlight::WarningLevel => styles.warning_level,
+    };
+    spans.push(Span::styled(line[start..end].to_string(), highlight_style));
+    cursor = end;
+  }
+
+  if cursor < range.end {
+    spans.push(Span::styled(
+      line[cursor..range.end].to_string(),
+      styles.text,
+    ));
+  }
+
+  spans
 }
 
 impl Scrollable for LogsState {
@@ -530,7 +645,7 @@ impl Scrollable for LogsState {
 mod tests {
   use k8s_openapi::api::core::v1::Namespace;
   use kube::api::ObjectMeta;
-  use ratatui::{backend::TestBackend, buffer::Buffer, layout::Position, Terminal};
+  use ratatui::{backend::TestBackend, buffer::Buffer, layout::Position, style::Color, Terminal};
 
   use super::*;
   use crate::app::{ns::KubeNs, ActiveBlock, RouteId};
@@ -967,6 +1082,142 @@ mod tests {
   }
 
   #[test]
+  fn test_json_log_keys_and_error_level_are_colored_without_changing_copied_text() {
+    let line = r#"2026-10-15T18:00:00Z [pod-name] {"level":"error","message":"bad"}"#;
+    let mut log = LogsState::new("json".into());
+    log.add_record(line.into());
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
+    terminal
+      .draw(|f| {
+        log.render_list(
+          f,
+          f.area(),
+          Block::default(),
+          LogStyles::with_json_styles(
+            Style::default().fg(Color::White),
+            Style::default().fg(Color::Blue),
+            Style::default().fg(Color::Red),
+            Style::default().fg(Color::Yellow),
+          ),
+          true,
+          false,
+        )
+      })
+      .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let key_start = line.find(r#""level""#).unwrap();
+    let error_start = line.find(r#""error""#).unwrap();
+    assert_eq!(buffer[(key_start as u16, 0)].fg, Color::Blue);
+    assert_eq!(buffer[((key_start + 6) as u16, 0)].fg, Color::Blue);
+    assert_eq!(buffer[(error_start as u16, 0)].fg, Color::Red);
+    assert_eq!(buffer[((error_start + 6) as u16, 0)].fg, Color::Red);
+    assert_eq!(
+      buffer[(line.find("bad").unwrap() as u16, 0)].fg,
+      Color::White
+    );
+    assert_eq!(log.get_plain_text(), format!("\n{line}"));
+  }
+
+  #[test]
+  fn test_warning_level_uses_theme_warning_color() {
+    let line = r#"{"level":"warning"}"#;
+    let mut log = LogsState::new("json".into());
+    log.add_record(line.into());
+
+    let mut terminal = Terminal::new(TestBackend::new(24, 1)).unwrap();
+    terminal
+      .draw(|f| {
+        log.render_list(
+          f,
+          f.area(),
+          Block::default(),
+          LogStyles::with_json_styles(
+            Style::default().fg(Color::White),
+            Style::default().fg(Color::Blue),
+            Style::default().fg(Color::Red),
+            Style::default().fg(Color::Yellow),
+          ),
+          true,
+          false,
+        )
+      })
+      .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let key_start = line.find(r#""level""#).unwrap();
+    let value_start = line.find(r#""warning""#).unwrap();
+    assert_eq!(buffer[(key_start as u16, 0)].fg, Color::Blue);
+    assert_eq!(buffer[(value_start as u16, 0)].fg, Color::Yellow);
+  }
+
+  #[test]
+  fn test_wrapped_json_log_keeps_key_and_error_colors_at_expected_cells() {
+    let mut log = LogsState::new("json".into());
+    log.add_record(r#"{"level": "error", "message": "long text here"}"#.into());
+
+    let mut terminal = Terminal::new(TestBackend::new(12, 5)).unwrap();
+    terminal
+      .draw(|f| {
+        log.render_list(
+          f,
+          f.area(),
+          Block::default(),
+          LogStyles::with_json_styles(
+            Style::default().fg(Color::White),
+            Style::default().fg(Color::Blue),
+            Style::default().fg(Color::Red),
+            Style::default().fg(Color::Yellow),
+          ),
+          true,
+          true,
+        )
+      })
+      .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(1, 0)].symbol(), "\"");
+    assert_eq!(buffer[(1, 0)].fg, Color::Blue);
+    assert_eq!(buffer[(0, 1)].symbol(), "\"");
+    assert_eq!(buffer[(0, 1)].fg, Color::Red);
+    assert_eq!(buffer[(1, 1)].fg, Color::Red);
+    assert_eq!(buffer[(1, 2)].symbol(), "m");
+    assert_eq!(buffer[(1, 2)].fg, Color::Blue);
+  }
+
+  #[test]
+  fn test_non_json_log_does_not_receive_json_colors() {
+    let mut log = LogsState::new("plain".into());
+    let line = r#"not json {"level":"error"} trailing"#;
+    log.add_record(line.into());
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+    terminal
+      .draw(|f| {
+        log.render_list(
+          f,
+          f.area(),
+          Block::default(),
+          LogStyles::with_json_styles(
+            Style::default().fg(Color::White),
+            Style::default().fg(Color::Blue),
+            Style::default().fg(Color::Red),
+            Style::default().fg(Color::Yellow),
+          ),
+          true,
+          false,
+        )
+      })
+      .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    for x in 0..line.len() as u16 {
+      assert_eq!(buffer[(x, 0)].fg, Color::White);
+    }
+  }
+
+  #[test]
   fn test_logs_state_bounded() {
     let mut log = LogsState::new("bounded".into());
 
@@ -979,9 +1230,9 @@ mod tests {
     assert_eq!(log.records.len(), MAX_LOG_RECORDS);
 
     // Oldest records should have been evicted — first record should be 100
-    assert_eq!(log.records.front().unwrap().0, "record 100");
+    assert_eq!(log.records.front().unwrap().text, "record 100");
     assert_eq!(
-      log.records.back().unwrap().0,
+      log.records.back().unwrap().text,
       format!("record {}", MAX_LOG_RECORDS + 99)
     );
   }
@@ -996,9 +1247,9 @@ mod tests {
     }
 
     assert_eq!(log.records.len(), MAX_LOG_RECORDS);
-    assert_eq!(log.records.front().unwrap().0, "record 0");
+    assert_eq!(log.records.front().unwrap().text, "record 0");
     assert_eq!(
-      log.records.back().unwrap().0,
+      log.records.back().unwrap().text,
       format!("record {}", MAX_LOG_RECORDS - 1)
     );
   }
@@ -1013,9 +1264,9 @@ mod tests {
 
     assert_eq!(log.records.len(), MAX_LOG_RECORDS);
     // First record should be evicted
-    assert_eq!(log.records.front().unwrap().0, "record 1");
+    assert_eq!(log.records.front().unwrap().text, "record 1");
     assert_eq!(
-      log.records.back().unwrap().0,
+      log.records.back().unwrap().text,
       format!("record {}", MAX_LOG_RECORDS)
     );
   }

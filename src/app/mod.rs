@@ -9,6 +9,7 @@ pub(crate) mod events;
 pub(crate) mod ingress;
 pub(crate) mod jobs;
 pub(crate) mod key_binding;
+pub(crate) mod log_highlight;
 pub(crate) mod metrics;
 pub(crate) mod models;
 pub(crate) mod network_policies;
