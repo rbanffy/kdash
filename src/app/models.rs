@@ -407,6 +407,8 @@ struct LogRecord {
 
 #[derive(Debug, Clone)]
 pub struct LogsState {
+  /// Stores the log records to be displayed
+  ///
   /// Original log text and render caches, bounded to `MAX_LOG_RECORDS`.
   records: VecDeque<LogRecord>,
   wrapped_length: usize,
