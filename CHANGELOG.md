@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Log views emphasize JSON-style string fields and `label=value` pairs.
+
 ## [2.1.1] - 2026-07-22
 
 ### Fixed

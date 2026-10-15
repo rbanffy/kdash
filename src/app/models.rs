@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, ops::Range, sync::OnceLock};
 
 use async_trait::async_trait;
 use ratatui::{
@@ -8,6 +8,7 @@ use ratatui::{
   widgets::{Block, List, ListItem, ListState, TableState},
   Frame,
 };
+use regex::Regex;
 use serde::Serialize;
 
 use super::{ActiveBlock, App, Route};
@@ -358,13 +359,15 @@ impl Scrollable for ScrollableTxt {
 // TODO implement line buffer to avoid gathering too much data in memory
 const MAX_LOG_RECORDS: usize = 10_000;
 
+static LOG_KEY_VALUE_RE: OnceLock<Regex> = OnceLock::new();
+
 #[derive(Debug, Clone)]
 pub struct LogsState {
   /// Stores the log messages to be displayed
   ///
   /// (original_message, (wrapped_message, wrapped_at_width))
   #[allow(clippy::type_complexity)]
-  records: VecDeque<(String, Option<(Vec<ListItem<'static>>, u16)>)>,
+  records: VecDeque<(String, Option<(Vec<ListItem<'static>>, u16, Style)>)>,
   wrapped_length: usize,
   viewport_height: usize,
   pub state: ListState,
@@ -474,7 +477,14 @@ impl LogsState {
     self
       .records
       .iter()
-      .map(|record| ListItem::new(Span::styled(record.0.clone(), style)))
+      .map(|record| {
+        ListItem::new(RatatuiLine::from(styled_log_spans(
+          &record.0,
+          0..record.0.len(),
+          &log_key_value_highlights(&record.0),
+          style,
+        )))
+      })
       .collect()
   }
 
@@ -486,20 +496,32 @@ impl LogsState {
       .iter_mut()
       .flat_map(|record| {
         if let Some(wrapped) = &record.1 {
-          if wrapped.1 == width {
+          if wrapped.1 == width && wrapped.2 == style {
             return wrapped.0.clone();
           }
         }
 
-        record.1 = Some((
-          textwrap::wrap(record.0.as_ref(), logs_area_width)
-            .into_iter()
-            .map(|line| line.to_string())
-            .map(|line| Span::styled(line, style))
-            .map(ListItem::new)
-            .collect::<Vec<ListItem<'_>>>(),
-          width,
-        ));
+        let highlights = log_key_value_highlights(&record.0);
+        let mut search_from = 0;
+        let items = textwrap::wrap(record.0.as_ref(), logs_area_width)
+          .into_iter()
+          .map(|line| {
+            let line = line.as_ref();
+            let relative_start = record.0[search_from..]
+              .find(line)
+              .expect("textwrap output must be found in the original log record");
+            let start = search_from + relative_start;
+            let end = start + line.len();
+            search_from = end;
+            ListItem::new(RatatuiLine::from(styled_log_spans(
+              &record.0,
+              start..end,
+              &highlights,
+              style,
+            )))
+          })
+          .collect::<Vec<_>>();
+        record.1 = Some((items, width, style));
 
         record
           .1
@@ -509,6 +531,51 @@ impl LogsState {
       })
       .collect()
   }
+}
+
+fn log_key_value_highlights(line: &str) -> Vec<Range<usize>> {
+  let regex = LOG_KEY_VALUE_RE.get_or_init(|| {
+    Regex::new(
+      r#""(?:\\.|[^"\\])*"\s*:\s*"(?:\\.|[^"\\])*"|[A-Za-z_][A-Za-z0-9_.-]*\s*=\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)"#,
+    )
+    .expect("log key/value regex is valid")
+  });
+  regex
+    .find_iter(line)
+    .map(|matched| matched.start()..matched.end())
+    .collect()
+}
+
+fn styled_log_spans(
+  line: &str,
+  range: Range<usize>,
+  highlights: &[Range<usize>],
+  style: Style,
+) -> Vec<Span<'static>> {
+  let mut spans = Vec::new();
+  let mut cursor = range.start;
+
+  for highlight in highlights {
+    let start = highlight.start.max(range.start);
+    let end = highlight.end.min(range.end);
+    if start >= end || end <= cursor {
+      continue;
+    }
+    if cursor < start {
+      spans.push(Span::styled(line[cursor..start].to_string(), style));
+    }
+    spans.push(Span::styled(
+      line[start..end].to_string(),
+      style.add_modifier(Modifier::BOLD),
+    ));
+    cursor = end;
+  }
+
+  if cursor < range.end {
+    spans.push(Span::styled(line[cursor..range.end].to_string(), style));
+  }
+
+  spans
 }
 
 impl Scrollable for LogsState {
@@ -964,6 +1031,39 @@ mod tests {
     }
 
     terminal.backend().assert_buffer(&expected5);
+  }
+
+  #[test]
+  fn highlights_json_and_logfmt_key_value_pairs() {
+    let line = r#"prefix {"message": "hello", "count": 2} level = error request.id='abc-123'"#;
+    let highlighted = log_key_value_highlights(line)
+      .into_iter()
+      .map(|range| &line[range])
+      .collect::<Vec<_>>();
+
+    assert_eq!(
+      highlighted,
+      vec![
+        r#""message": "hello""#,
+        "level = error",
+        "request.id='abc-123'"
+      ]
+    );
+  }
+
+  #[test]
+  fn key_value_highlights_are_bold() {
+    let line = "level=error";
+    let spans = styled_log_spans(
+      line,
+      0..line.len(),
+      &log_key_value_highlights(line),
+      Style::default(),
+    );
+
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].content, line);
+    assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
   }
 
   #[test]
